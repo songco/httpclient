@@ -1,0 +1,285 @@
+From cc817ace8b8d8c6ac0cbc626af7b5d9c6a9131b6 Mon Sep 17 00:00:00 2001
+From: Colin Song <Colin.Song@software.dell.com>
+Date: Thu, 25 Jun 2015 15:45:11 +0800
+Subject: [PATCH] Fix NTLM auth issue when domain netbios name not match domain
+ dns name
+
+---
+ .../java/org/apache/http/auth/NTCredentials.java   | 71 ++++++++++++++++++++--
+ .../org/apache/http/impl/auth/NTLMEngineImpl.java  | 38 +++---------
+ .../java/org/apache/http/impl/auth/NTLMScheme.java |  4 +-
+ .../java/org/apache/http/auth/TestCredentials.java | 10 +--
+ 4 files changed, 82 insertions(+), 41 deletions(-)
+
+diff --git a/httpclient/src/main/java/org/apache/http/auth/NTCredentials.java b/httpclient/src/main/java/org/apache/http/auth/NTCredentials.java
+index fabb9c5..22407e7 100644
+--- a/httpclient/src/main/java/org/apache/http/auth/NTCredentials.java
++++ b/httpclient/src/main/java/org/apache/http/auth/NTCredentials.java
+@@ -51,9 +51,12 @@ public class NTCredentials implements Credentials, Serializable {
+     /** Password */
+     private final String password;
+ 
+-    /** The host the authentication request is originating from.  */
++    /** The netbios hostname the authentication request is originating from.  */
+     private final String workstation;
+ 
++    /** The netbios domain the authentication request is against */
++    private final String netbiosDomain;
++
+     /**
+      * The constructor with the fully qualified username and password combined
+      * string argument.
+@@ -83,6 +86,7 @@ public class NTCredentials implements Credentials, Serializable {
+                     username.substring(atSlash + 1));
+         }
+         this.workstation = null;
++        this.netbiosDomain = null;
+     }
+ 
+     /**
+@@ -99,6 +103,25 @@ public class NTCredentials implements Credentials, Serializable {
+             final String password,
+             final String workstation,
+             final String domain) {
++        this(userName, password, convertHost(workstation), domain, convertDomain(domain));
++    }
++
++    /**
++     * Constructor.
++     * @param userName The user name.  This should not include the domain to authenticate with.
++     * For example: "user" is correct whereas "DOMAIN\\user" is not.
++     * @param password The password.
++     * @param workstation The netbios workstation name that the authentication request is originating from.
++     * Essentially, the computer name for this machine.
++     * @param domain The domain to authenticate within.
++     * @param netbiosDomain The netbios version of the domain name.
++     */
++    public NTCredentials(
++            final String userName,
++            final String password,
++            final String workstation,
++            final String domain,
++            final String netbiosDomain) {
+         super();
+         Args.notNull(userName, "User name");
+         this.principal = new NTUserPrincipal(domain, userName);
+@@ -108,6 +131,11 @@ public class NTCredentials implements Credentials, Serializable {
+         } else {
+             this.workstation = null;
+         }
++        if (netbiosDomain != null) {
++            this.netbiosDomain = netbiosDomain.toUpperCase(Locale.ENGLISH);
++        } else {
++            this.netbiosDomain = null;
++        }
+     }
+ 
+     public Principal getUserPrincipal() {
+@@ -132,9 +160,17 @@ public class NTCredentials implements Credentials, Serializable {
+     }
+ 
+     /**
+-     * Retrieves the workstation name of the computer originating the request.
++    * Retrieves the netbios domain to authenticate with.
++    * @return String the netbios domain name.
++    */
++    public String getNetbiosDomain() {
++        return this.netbiosDomain;
++    }
++
++    /**
++     * Retrieves the netbios workstation name of the computer originating the request.
+      *
+-     * @return String the workstation the user is logged into.
++     * @return String the netbios workstation the user is logged into.
+      */
+     public String getWorkstation() {
+         return this.workstation;
+@@ -145,6 +181,7 @@ public class NTCredentials implements Credentials, Serializable {
+         int hash = LangUtils.HASH_SEED;
+         hash = LangUtils.hashCode(hash, this.principal);
+         hash = LangUtils.hashCode(hash, this.workstation);
++        hash = LangUtils.hashCode(hash, this.netbiosDomain);
+         return hash;
+     }
+ 
+@@ -156,7 +193,8 @@ public class NTCredentials implements Credentials, Serializable {
+         if (o instanceof NTCredentials) {
+             final NTCredentials that = (NTCredentials) o;
+             if (LangUtils.equals(this.principal, that.principal)
+-                    && LangUtils.equals(this.workstation, that.workstation)) {
++                    && LangUtils.equals(this.workstation, that.workstation)
++                    && LangUtils.equals(this.netbiosDomain, that.netbiosDomain)) {
+                 return true;
+             }
+         }
+@@ -170,8 +208,33 @@ public class NTCredentials implements Credentials, Serializable {
+         buffer.append(this.principal);
+         buffer.append("][workstation: ");
+         buffer.append(this.workstation);
++        buffer.append("][netbiosDomain: ");
++        buffer.append(this.netbiosDomain);
+         buffer.append("]");
+         return buffer.toString();
+     }
+ 
++    /** Strip dot suffix from a name */
++    private static String stripDotSuffix(final String value) {
++        if (value == null) {
++            return null;
++        }
++        final int index = value.indexOf(".");
++        if (index != -1) {
++            return value.substring(0, index);
++        }
++        return value;
++    }
++
++    /** Convert host to standard form */
++    private static String convertHost(final String host) {
++        return stripDotSuffix(host);
++    }
++
++    /** Convert domain to standard form */
++    private static String convertDomain(final String domain) {
++        final String returnString = stripDotSuffix(domain);
++        return returnString == null ? returnString : returnString.toUpperCase(Locale.ROOT);
++    }
++
+ }
+diff --git a/httpclient/src/main/java/org/apache/http/impl/auth/NTLMEngineImpl.java b/httpclient/src/main/java/org/apache/http/impl/auth/NTLMEngineImpl.java
+index 2c99de4..8545485 100644
+--- a/httpclient/src/main/java/org/apache/http/impl/auth/NTLMEngineImpl.java
++++ b/httpclient/src/main/java/org/apache/http/impl/auth/NTLMEngineImpl.java
+@@ -184,28 +184,6 @@ final class NTLMEngineImpl implements NTLMEngine {
+         this.credentialCharset = credentialCharset;
+     }
+ 
+-    /** Strip dot suffix from a name */
+-    private static String stripDotSuffix(final String value) {
+-        if (value == null) {
+-            return null;
+-        }
+-        final int index = value.indexOf(".");
+-        if (index != -1) {
+-            return value.substring(0, index);
+-        }
+-        return value;
+-    }
+-
+-    /** Convert host to standard form */
+-    private static String convertHost(final String host) {
+-        return stripDotSuffix(host);
+-    }
+-
+-    /** Convert domain to standard form */
+-    private static String convertDomain(final String domain) {
+-        return stripDotSuffix(domain);
+-    }
+-
+     private static int readULong(final byte[] src, final int index) throws NTLMEngineException {
+         if (src.length < index + 4) {
+             throw new NTLMEngineException("NTLM authentication - buffer too small for DWORD");
+@@ -997,10 +975,10 @@ final class NTLMEngineImpl implements NTLMEngine {
+         Type1Message(final String domain, final String host) throws NTLMEngineException {
+             super();
+             try {
+-                // Strip off domain name from the host!
+-                final String unqualifiedHost = convertHost(host);
+-                // Use only the base domain name!
+-                final String unqualifiedDomain = convertDomain(domain);
++                // All host name manipulations now take place in the credentials
++                final String unqualifiedHost = host;
++                // All domain name manipulations now take place in the credentials
++                final String unqualifiedDomain = domain;
+ 
+                 hostBytes = unqualifiedHost != null? unqualifiedHost.getBytes("ASCII") : null;
+                 domainBytes = unqualifiedDomain != null ? unqualifiedDomain
+@@ -1189,10 +1167,10 @@ final class NTLMEngineImpl implements NTLMEngine {
+             // Save the flags
+             this.type2Flags = type2Flags;
+ 
+-            // Strip off domain name from the host!
+-            final String unqualifiedHost = convertHost(host);
+-            // Use only the base domain name!
+-            final String unqualifiedDomain = convertDomain(domain);
++            // All host name manipulations now take place in the credentials
++            final String unqualifiedHost = host;
++            // All domain name manipulations now take place in the credentials
++            final String unqualifiedDomain = domain;
+ 
+             // Create a cipher generator class.  Use domain BEFORE it gets modified!
+             final CipherGen gen = new CipherGen(unqualifiedDomain, user, password, nonce, target, targetInformation);
+diff --git a/httpclient/src/main/java/org/apache/http/impl/auth/NTLMScheme.java b/httpclient/src/main/java/org/apache/http/impl/auth/NTLMScheme.java
+index 88bd9fa..29f8f47 100644
+--- a/httpclient/src/main/java/org/apache/http/impl/auth/NTLMScheme.java
++++ b/httpclient/src/main/java/org/apache/http/impl/auth/NTLMScheme.java
+@@ -132,14 +132,14 @@ public class NTLMScheme extends AuthSchemeBase {
+             throw new AuthenticationException("NTLM authentication failed");
+         } else if (this.state == State.CHALLENGE_RECEIVED) {
+             response = this.engine.generateType1Msg(
+-                    ntcredentials.getDomain(),
++                    ntcredentials.getNetbiosDomain(),
+                     ntcredentials.getWorkstation());
+             this.state = State.MSG_TYPE1_GENERATED;
+         } else if (this.state == State.MSG_TYPE2_RECEVIED) {
+             response = this.engine.generateType3Msg(
+                     ntcredentials.getUserName(),
+                     ntcredentials.getPassword(),
+-                    ntcredentials.getDomain(),
++                    ntcredentials.getNetbiosDomain(),
+                     ntcredentials.getWorkstation(),
+                     this.challenge);
+             this.state = State.MSG_TYPE3_GENERATED;
+diff --git a/httpclient/src/test/java/org/apache/http/auth/TestCredentials.java b/httpclient/src/test/java/org/apache/http/auth/TestCredentials.java
+index 10564a0..cc90340 100644
+--- a/httpclient/src/test/java/org/apache/http/auth/TestCredentials.java
++++ b/httpclient/src/test/java/org/apache/http/auth/TestCredentials.java
+@@ -70,7 +70,7 @@ public class TestCredentials {
+         Assert.assertEquals(new NTUserPrincipal("DOMAIN", "name"),
+                 creds1.getUserPrincipal());
+         Assert.assertEquals("pwd", creds1.getPassword());
+-        Assert.assertEquals("[principal: DOMAIN\\name][workstation: LOCALHOST]",
++        Assert.assertEquals("[principal: DOMAIN\\name][workstation: LOCALHOST][netbiosDomain: DOMAIN]",
+                 creds1.toString());
+         final NTCredentials creds2 = new NTCredentials(
+                 "name", null, null, null);
+@@ -78,7 +78,7 @@ public class TestCredentials {
+         Assert.assertEquals(new NTUserPrincipal(null, "name"),
+                 creds2.getUserPrincipal());
+         Assert.assertEquals(null, creds2.getPassword());
+-        Assert.assertEquals("[principal: name][workstation: null]",
++        Assert.assertEquals("[principal: name][workstation: null][netbiosDomain: null]",
+                 creds2.toString());
+         final NTCredentials creds3 = new NTCredentials(
+                 "domain/name:pwd");
+@@ -86,7 +86,7 @@ public class TestCredentials {
+         Assert.assertEquals(new NTUserPrincipal("DOMAIN", "name"),
+                 creds3.getUserPrincipal());
+         Assert.assertEquals("pwd", creds3.getPassword());
+-        Assert.assertEquals("[principal: DOMAIN\\name][workstation: null]",
++        Assert.assertEquals("[principal: DOMAIN\\name][workstation: null][netbiosDomain: null]",
+                 creds3.toString());
+         final NTCredentials creds4 = new NTCredentials(
+             "domain/name");
+@@ -94,7 +94,7 @@ public class TestCredentials {
+         Assert.assertEquals(new NTUserPrincipal("DOMAIN", "name"),
+                 creds4.getUserPrincipal());
+         Assert.assertEquals(null, creds4.getPassword());
+-        Assert.assertEquals("[principal: DOMAIN\\name][workstation: null]",
++        Assert.assertEquals("[principal: DOMAIN\\name][workstation: null][netbiosDomain: null]",
+                 creds4.toString());
+         final NTCredentials creds5 = new NTCredentials(
+             "name");
+@@ -102,7 +102,7 @@ public class TestCredentials {
+         Assert.assertEquals(new NTUserPrincipal(null, "name"),
+                 creds5.getUserPrincipal());
+         Assert.assertEquals(null, creds5.getPassword());
+-        Assert.assertEquals("[principal: name][workstation: null]",
++        Assert.assertEquals("[principal: name][workstation: null][netbiosDomain: null]",
+                 creds5.toString());
+     }
+ 
+-- 
+1.8.1.msysgit.1
+
