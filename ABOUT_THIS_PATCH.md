@@ -1,0 +1,13 @@
+Changes:
+========
+Add a constructor in NTCredentials, accept customized NetBios Domain Name to aoid strip on domain name.
+This fix below scenario:
+	A domain's NetBios name is "my-domain", it's dns name is "mydomain.com"
+Before this change, the httpclient will use "mydomain" as domain name in NTLM auth and this name is wrong, the correct one is "my-domain".
+
+For more detail, please check : https://issues.apache.org/jira/browse/HTTPCLIENT-1662 
+
+
+
+
+
